@@ -45,7 +45,11 @@ jobs:
   build:
     # 必须 standard runner：larger runner 在 public 仓库也照常计费
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 刻意不写 timeout-minutes —— 用 GitHub 默认的 360 分钟。
+    # 原私有工作流的 40 分钟唯一目的是卡住计费墙钟（私有额度 2000 分钟/月），
+    # 而 public 仓库的 standard runner 分钟数免费，这个上限只剩坏处：
+    # 本仓库首次构建缓存是空的，要冷下载全部 Gradle 依赖 + NDK/CMake，
+    # 而私有仓库那批「有缓存」的 debug 构建就已经跑到 37.9 / 38.9 / 40.0 分钟。
     steps:
       - name: Preflight — 检查必需的 secret
         env:
