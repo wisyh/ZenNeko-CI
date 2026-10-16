@@ -21,6 +21,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Build ZenNeko
+# 运行列表里显示成 "Build ZenNeko @ <ref>"，一眼看出每个 run 构建的是哪份代码
+run-name: Build ZenNeko @ ${{ inputs.ref }}
 
 on:
   workflow_dispatch:
@@ -28,7 +30,10 @@ on:
       ref:
         description: '要构建的 ZenNeko ref（分支 / tag / SHA）'
         required: false
-        default: 'ci-build'
+        default: 'main'
+        # 默认值从 ci-build 改成 main：ZenNeko 远端默认分支仍是历史遗留的 ci-build
+        # （里面只有 GitBuilder 的 "CI build (debug)" 自动提交），
+        # 而新工具 scripts/ci_build.py 推送到的是 main。
   # 故意不配置 push / pull_request 触发：
   # 本仓库是 public 的，任何人都能 fork 并提 PR。一旦让 PR 触发 workflow，
   # 就等于允许外部代码在持有 ZN_TOKEN 的 runner 上执行。
