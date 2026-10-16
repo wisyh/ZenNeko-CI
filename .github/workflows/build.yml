@@ -1,0 +1,220 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 公开的「外壳」构建仓库 —— 本仓库里只有这一个 YAML。
+#
+# 私有仓库 wisyh/ZenNeko 的源码在 runner 的临时工作区里被 checkout 出来编译，
+# 用完即销毁，不会以任何形式提交回本仓库。
+#
+# 为什么这样能省额度：GitHub 计费文档明确写着，standard GitHub-hosted runner
+#   "is free: In public repositories"
+# 只有 private repository 才吃 2000 分钟/月的免费额度。
+# ⚠️ 但 larger runner 即使在 public 仓库也照常收费，所以下面必须用 ubuntu-latest。
+#
+# 本文件是公开可见的，所以这些内容一律不写死在这里：
+#   · 防混淆断言要查的字符串（接口域名、内部符号名）→ secrets.GUARD_STRINGS
+#   · 签名 keystore 密码 → 每次构建随机生成，真实 release.jks 的密码永不出现
+#
+# public 仓库的两条硬约束（决定了下面为什么这么写）：
+#   · 运行日志是公开的 → 绝不 echo 任何 secret，也绝不回显受检字符串本身
+#   · artifact 任何人都能下载（REST 文档："Anyone with read access to the
+#     repository can use this endpoint"，而 public 仓库人人都有 read）
+#     → 因此本工作流**不上传 artifact**，产物只推回私有仓库的 Release
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build ZenNeko
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的 ZenNeko ref（分支 / tag / SHA）'
+        required: false
+        default: 'ci-build'
+  # 故意不配置 push / pull_request 触发：
+  # 本仓库是 public 的，任何人都能 fork 并提 PR。一旦让 PR 触发 workflow，
+  # 就等于允许外部代码在持有 ZN_TOKEN 的 runner 上执行。
+
+permissions:
+  contents: read   # 本仓库自己的 GITHUB_TOKEN 只读，杜绝误在本仓库建 Release / 改代码
+  actions: write   # 仅供 Actions 缓存读写；不含任何代码或 Release 写权限
+
+concurrency:
+  group: zenneko-public-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 必须 standard runner：larger runner 在 public 仓库也照常计费
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Preflight — 检查必需的 secret
+        env:
+          ZN_TOKEN: ${{ secrets.ZN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ZN_TOKEN:-}" ]; then
+            echo "::error::缺少 secret ZN_TOKEN（细粒度 PAT，仅授权 wisyh/ZenNeko 的 Contents: Read and write）。"
+            echo "::error::添加位置：本仓库 Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+          echo "preflight OK"
+
+      - name: Checkout 私有源码 wisyh/ZenNeko
+        uses: actions/checkout@v4
+        with:
+          repository: wisyh/ZenNeko
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.ZN_TOKEN }}
+          persist-credentials: false   # 不要把 PAT 留在 .git/config
+          fetch-depth: 1               # 浅克隆：只为编译，不需要历史
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 默认 gradle-home-cache-includes 是 `caches`，它包含 caches/build-cache-1 ——
+      # 那是**由私有源码编译出来的产物**，而本仓库的 Actions 缓存对持有 repo scope
+      # token 的账号可读。所以这里刻意排除 build-cache-1，只缓存第三方依赖。
+      - name: Set up Gradle cache（仅依赖，排除 build cache）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-overwrite-existing: false
+          gradle-home-cache-excludes: |
+            caches/build-cache-1
+
+      # 真实 release.jks 不入库（.gitignore 第 38 行），CI 现场生成一次性 keystore。
+      # 关键区别：密码用**随机值**，而不是仓库里那把真 keystore 的密码 ——
+      # 本文件是公开的，写死密码等于把 release.jks 的密码公之于众。
+      - name: Generate throwaway CI signing keystore
+        run: |
+          set -euo pipefail
+          PASS="$(openssl rand -hex 16)"
+          echo "::add-mask::$PASS"
+          echo "CI_KS_PASS=$PASS" >> "$GITHUB_ENV"
+          keytool -genkeypair -v \
+            -keystore release.jks \
+            -alias zenneko \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=ZenNeko CI, OU=CI, O=wisyh, L=CN, ST=CN, C=CN"
+          echo "一次性 keystore 已生成（随机密码，已 add-mask）"
+
+      - name: Build debug APK
+        env:
+          # ORG_GRADLE_PROJECT_* 会覆盖 gradle.properties 里的同名属性
+          ORG_GRADLE_PROJECT_key_alias: zenneko
+          ORG_GRADLE_PROJECT_key_password: ${{ env.CI_KS_PASS }}
+          ORG_GRADLE_PROJECT_store_password: ${{ env.CI_KS_PASS }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+
+      # 断言：每个 ABI 分包都存在、都带 libcore.so、符号表被剥干净、
+      # 且受保护字符串没有因 -O3/-flto 常量折叠而落回 .rodata。
+      # 受检字符串来自 secret，公开的 YAML 与日志里都不出现它们的值。
+      - name: Assert ABI splits and libcore.so cleanliness
+        env:
+          GUARD_STRINGS: ${{ secrets.GUARD_STRINGS }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+
+          apks=(app/build/outputs/apk/debug/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::没有产出任何 APK"
+            exit 1
+          fi
+          echo "产物：${apks[*]}"
+
+          fail=0
+          for abi in arm64-v8a armeabi-v7a; do
+            if ! ls app/build/outputs/apk/debug/*"$abi"*.apk >/dev/null 2>&1; then
+              echo "::error::缺少 $abi 分包 —— 检查 app 与 core/nativebridge 两处 abiFilters 是否都含它"
+              fail=1
+            fi
+          done
+
+          guards=()
+          if [ -n "${GUARD_STRINGS:-}" ]; then
+            while IFS= read -r line; do
+              line="${line%%#*}"
+              line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              [ -n "$line" ] && guards+=("$line")
+            done <<< "$GUARD_STRINGS"
+            echo "从 GUARD_STRINGS 载入 ${#guards[@]} 条受检字符串"
+          else
+            echo "::warning::未设置 secret GUARD_STRINGS —— 跳过明文/符号泄漏断言（结构检查仍会执行）"
+          fi
+
+          for APK in "${apks[@]}"; do
+            rm -rf /tmp/nl && mkdir -p /tmp/nl
+            unzip -o -q "$APK" 'lib/*' -d /tmp/nl
+            core=$(find /tmp/nl/lib -name libcore.so 2>/dev/null | head -1)
+            if [ -z "$core" ]; then
+              echo "::error::$APK 里没有 libcore.so"
+              fail=1
+              continue
+            fi
+            echo "--- $(basename "$APK")  →  $(basename "$(dirname "$core")")  ($(stat -c%s "$core") 字节)"
+
+            # 只报命中数量，不回显字符串本身：本仓库日志是公开的
+            for g in "${guards[@]}"; do
+              n=$(strings -a "$core" | grep -c -F -- "$g" || true)
+              if [ "$n" != "0" ]; then
+                echo "::error::$(basename "$APK") 的 libcore.so 里出现受保护字符串（$n 处）"
+                fail=1
+              fi
+            done
+
+            if readelf -S "$core" 2>/dev/null | grep -q '\.symtab'; then
+              echo "::error::$(basename "$APK") 的 libcore.so 还带 .symtab —— -Wl,--strip-all 没生效"
+              fail=1
+            fi
+
+            uw=$(readelf -S "$core" 2>/dev/null | grep -c -E '\.eh_frame|\.ARM\.exidx' || true)
+            echo "    unwind 相关段: $uw 个（越少越好，0 最理想）"
+          done
+
+          if [ "$fail" != "0" ]; then
+            echo "字符串混淆或分包有问题，详见上面 ::error::"
+            exit 1
+          fi
+          echo "结构与混淆断言通过 ✅"
+
+      # 产物推回**私有**仓库，而不是本仓库 —— 本仓库是 public 的，
+      # 在这里建 Release 等于把 debug APK 公开发布。
+      - name: Publish APK to private ZenNeko Release
+        env:
+          GH_TOKEN: ${{ secrets.ZN_TOKEN }}
+          TARGET_REPO: wisyh/ZenNeko
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          apks=(app/build/outputs/apk/debug/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::没有 APK 可发布"
+            exit 1
+          fi
+
+          TAG="ci-latest-debug"
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${apks[@]}" --repo "$TARGET_REPO" --clobber
+          else
+            gh release create "$TAG" "${apks[@]}" --repo "$TARGET_REPO" \
+              --title "CI 最新产物（debug）" \
+              --notes "由 public 构建仓库 ZenNeko-CI 产出；每次构建覆盖资产，不累积存储。" \
+              --prerelease
+          fi
+
+          echo "---- $TARGET_REPO 的 Release 资产 ----"
+          gh release view "$TAG" --repo "$TARGET_REPO" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size) 字节"'
+
+      - name: Note — 产物需本地重签
+        run: |
+          echo "::notice::产物已推到私有仓库 Release（tag: ci-latest-debug）。用的是 CI 一次性 keystore，装机前必须用本地 release.jks 重签。"
