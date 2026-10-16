@@ -99,6 +99,11 @@ jobs:
       - name: Generate throwaway CI signing keystore
         run: |
           set -euo pipefail
+          # 工作区里可能残留一把 keystore：ZenNeko 私有仓库的历史提交里有一份
+          # release.jks（早于 GitBuilder 的安全红线出现，属于遗留）。它一旦在，
+          # keytool -genkeypair 会先尝试用下面的随机密码去解密它，直接以
+          # 「keystore password was incorrect」失败 —— 所以必须先清掉。
+          rm -f release.jks
           PASS="$(openssl rand -hex 16)"
           echo "::add-mask::$PASS"
           echo "CI_KS_PASS=$PASS" >> "$GITHUB_ENV"
