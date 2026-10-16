@@ -116,6 +116,26 @@ jobs:
             -dname "CN=ZenNeko CI, OU=CI, O=wisyh, L=CN, ST=CN, C=CN"
           echo "一次性 keystore 已生成（随机密码，已 add-mask）"
 
+      - name: Give Gradle enough memory for a cold multi-module build
+        # ZenNeko 是 39+ 模块的 Compose 工程，冷构建（公开仓库缓存刻意不含
+        # Gradle 构建缓存，见 setup-gradle 那步的注释）时：
+        #   项目 gradle.properties 的 -Xmx2048m + kotlin in-process + 4 路并行
+        #   → 4 个 Kotlin 编译器挤在一个 2G 堆进程里，必然 OOM，
+        #     daemon 被杀 → DaemonConnectionException（实跑实测）。
+        # 这里通过 **user-home** gradle.properties 覆盖（优先于项目级）：
+        #   堆给足、Kotlin 编译器挪到独立进程、并行收到 2 路。
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+
+          org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          kotlin.compiler.execution.strategy=daemon
+          kotlin.daemon.jvmargs=-Xmx3g
+          EOF
+          echo "已写入 $HOME/.gradle/gradle.properties（内存/并行/Kotlin 进程策略）"
+
       - name: Build debug APK
         env:
           # ORG_GRADLE_PROJECT_* 会覆盖 gradle.properties 里的同名属性
@@ -125,7 +145,9 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --stacktrace
+          # --no-daemon：CI 里一次构建用掉就跑，不保留常驻 daemon，
+          # 顺带去掉「daemon 失联」这一类偶发失败模式。
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
       # 断言：每个 ABI 分包都存在、都带 libcore.so、符号表被剥干净、
       # 且受保护字符串没有因 -O3/-flto 常量折叠而落回 .rodata。
